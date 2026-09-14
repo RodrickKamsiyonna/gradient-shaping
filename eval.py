@@ -35,7 +35,14 @@ def _patched_init_action(self, n_envs, actions=None):
     # Add the sample dimension to whatever warm-started actions we already have:
     # [n_envs, t, action_dim] -> [n_envs, num_samples, t, action_dim]
     actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
-
+    actions[:, 1:] += (
+    torch.randn(
+        actions[:, 1:].shape,
+        generator=self.torch_gen,
+        device=self.device,
+        dtype=self.dtype,
+    )
+    * self.var_scale)
     remaining = self.horizon - actions.shape[2]
 
     if remaining > 0:
