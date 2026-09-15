@@ -107,7 +107,7 @@ def _patched_init_action(self, n_envs, actions=None):
                     generator=self.torch_gen,
                     device=self.device,
                     dtype=self.dtype,
-                ) * 0.5
+                )
             )
 
     remaining = self.horizon - warm_len
