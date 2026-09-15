@@ -23,6 +23,7 @@ from torchvision.transforms import v2 as transforms
 #
 # This patch ensures the action tensor is created directly with the solver
 # dtype/device before it is registered as the optimization parameter.
+"""
 def _patched_init_action(self, n_envs, actions=None):
     if actions is None:
         actions = torch.zeros(
@@ -79,8 +80,64 @@ def _patched_init_action(self, n_envs, actions=None):
 
 GradientSolver.init_action = _patched_init_action
 # ---------------------------------------------------------------------------
+"""
+def _patched_init_action(self, n_envs, actions=None):
+    if actions is None:
+        warm_len = 0
+        actions = torch.empty(
+            (n_envs, self.num_samples, 0, self.action_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+    else:
+        actions = actions.to(self.device)
+        warm_len = actions.shape[1]
+
+        # [n_envs, t, action_dim]
+        # -> [n_envs, num_samples, t, action_dim]
+        actions = actions.unsqueeze(1).repeat_interleave(
+            self.num_samples, dim=1
+        )
+
+        # Perturb warm-started candidates independently.
+        if self.num_samples > 1:
+            actions[:, 1:] += (
+                torch.randn(
+                    actions[:, 1:].shape,
+                    generator=self.torch_gen,
+                    device=self.device,
+                    dtype=self.dtype,
+                ) * 0.5
+            )
+
+    remaining = self.horizon - warm_len
+
+    if remaining > 0:
+        new_actions = torch.randn(
+            n_envs,
+            self.num_samples,
+            remaining,
+            self.action_dim,
+            generator=self.torch_gen,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        actions = torch.cat([actions, new_actions], dim=2)
+
+    if hasattr(self, "init") and self.init.shape == actions.shape:
+        self.init.copy_(actions)
+    else:
+        if "init" in self._parameters:
+            del self._parameters["init"]
+
+        self.register_parameter(
+            "init",
+            torch.nn.Parameter(actions)
+        )
 
 
+GradientSolver.init_action = _patched_init_action
 def img_transform(cfg):
     """
     Transform images into the representation expected by the world model.
