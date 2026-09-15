@@ -1,206 +1,261 @@
-# LeWorldModel (Kaggle Edition)
+LeWorldModel with Landscape Shaping (EQM-LeWM)
+Stable End-to-End Joint-Embedding Predictive Architecture with Action-Landscape Shaping
+This repository extends LeWorldModel (LeWM) with Equilibrium Matching (EQM) / Landscape Shaping for latent planning. It supports training and evaluation both locally and on cloud environments like Kaggle (T4 / P100 / Dual T4).  
+PDF
 
-### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels
+🔬 Method Overview
+Standard Joint-Embedding Predictive Architectures (JEPAs) train a predictive world model by minimizing prediction error in latent space while applying anti-collapse regularizers such as SIGReg. However, when latents are used for gradient-based or sampling-based planning, Euclidean distance often fails to match environment topology—causing action optimization to stall at local minima or cut through infeasible transitions.  
+PDF
++ 1
 
-[Lucas Maes\*](https://x.com/lucasmaes_), [Quentin Le Lidec\*](https://quentinll.github.io/), [Damien Scieur](https://scholar.google.com/citations?user=hNscQzgAAAAJ&hl=fr), [Yann LeCun](https://yann.lecun.com/) and [Randall Balestriero](https://randallbalestriero.github.io/)
+This implementation introduces an Equilibrium Matching (EQM) auxiliary loss (lejepa_forward) that explicitly conditions the action-energy gradient field:  
+PDF
 
-> **Note:** This is a customized fork of the original LeWM repository designed specifically for **Kaggle**. If you don't have access to a local GPU, you can use the instructions below to train this state-of-the-art World Model entirely in the cloud for free with the kaggle T4.
+Latent Predictive Step:
 
-**Abstract:** Joint Embedding Predictive Architectures (JEPAs) offer a compelling framework for learning world models in compact latent spaces, yet existing methods remain fragile, relying on complex multi-term losses, exponential moving averages, pretrained encoders, or auxiliary supervision to avoid representation collapse. In this work, we introduce LeWorldModel (LeWM), the first JEPA that trains stably end-to-end from raw pixels using only two loss terms: a next-embedding prediction loss and a regularizer enforcing Gaussian-distributed latent embeddings. This reduces tunable loss hyperparameters from six to one compared to the only existing end-to-end alternative. With \~15M parameters trainable on a single GPU in a few hours, LeWM plans up to 48× faster than foundation-model-based world models while remaining competitive across diverse 2D and 3D control tasks. Beyond control, we show that LeWM's latent space encodes meaningful physical structure through probing of physical quantities. Surprise evaluation confirms that the model reliably detects physically implausible events.
+L 
+pred
+​
+ =E[∥ 
+z
+^
+  
+t+1:t+K
+​
+ −z 
+t+1:t+K
+​
+ ∥ 
+2
+2
+​
+ ]
+  
+PDF
+Action-Interpolation & Energy:
+For noisy action paths a 
+γ
+​
+ =γa+(1−γ)ϵ with ϵ∼N(0,I) and γ∼U(0,1), the prediction energy is:
+  
+PDF
 
-\<p align="center"\>
-\<b\>[ \<a href="[https://arxiv.org/pdf/2603.19312v1](https://arxiv.org/pdf/2603.19312v1)"\>Paper\</a\> | \<a href="[https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY\_e5nh3XT4r4e?usp=sharing](https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e?usp=sharing)"\>Checkpoints\</a\> | \<a href="[https://huggingface.co/collections/quentinll/lewm](https://huggingface.co/collections/quentinll/lewm)"\>Data\</a\> | \<a href="[https://le-wm.github.io/](https://le-wm.github.io/)"\>Website\</a\> ]\</b\>
-\</p\>
+E 
+θ
+​
+ (a 
+γ
+​
+ )=∥p 
+ϕ
+​
+ (z 
+c
+​
+ ,g 
+ψ
+​
+ (a 
+γ
+​
+ ))−z 
+g
+​
+ ∥ 
+2
+2
+​
+ 
+  
+PDF
+Landscape Shaping Gradient Penalty:
 
------
+L 
+eqm
+​
+ =E 
+a,ϵ,γ
+​
+ [∥∇ 
+a 
+γ
+​
+ 
+​
+ E 
+θ
+​
+ (a 
+γ
+​
+ )−κ(1−γ)(ϵ−a)∥ 
+2
+2
+​
+ ]
+  
+PDF
+Composite Training Objective:
 
-## 🚀 Running on Kaggle (No Local GPU Required)
+L=L 
+pred
+​
+ +αL 
+eqm
+​
+ +λL 
+sigreg
+​
+ 
+  
+PDF
+This regularizes local descent directions toward feasible dynamic paths, preventing pathological trajectories in topologically constrained tasks (e.g., Two Rooms) and contact-rich environments (e.g., PushT).  
+PDF
 
-You can run this entire training pipeline using a free Kaggle GPU notebook. Open a new Kaggle Notebook, ensure the **Accelerator** is set to  GPU (T4x2), and run the following blocks in sequential cells.
+📁 Repository Structure
+Plaintext
 
-### Step 1: Environment Setup & Installation
 
-Clone this repository, install the required packages, and set up the necessary directory structures.
+├── config/
+│   ├── train/            # Hydra training configs (lewm.yaml, data overrides)
+│   └── eval/             # Evaluation configs (tworoom.yaml, pusht.yaml)
+├── jepa.py               # JEPA architecture, rollout logic, & MPC criterion
+├── module.py             # ViT, ARPredictor, Embedder, MLP, SIGReg modules
+├── train.py              # Main training script (Lightning + Hydra + SPT)
+├── eval.py               # Model predictive control / planner evaluation
+└── utils.py              # Callbacks, image transforms, and normalizers
+⚙️ Installation
+Local Setup (Recommended: Python 3.10)
+Bash
 
-```python
-# Clone the repository and move into it
-!git clone https://github.com/RodrickKamsiyonna/le-wm_kaggle.git
-%cd le-wm_kaggle
 
-# Install dependencies
-!pip install hydra-core stable_worldmodel stable_pretraining lightning huggingface_hub
+# Clone the repository
+git clone https://github.com/RodrickKamsiyonna/le-wm_kaggle.git
+cd le-wm_kaggle
 
-# Set up environment variables and directories
-import os
-os.makedirs("/kaggle/working/stablewm", exist_ok=True)
-os.makedirs("/kaggle/data", exist_ok=True)
+# Create and activate environment
+python -m venv .venv
+source .venv/bin/activate
 
-os.environ["STABLEWM_HOME"] = "/kaggle/working/stablewm"
-os.environ["HYDRA_FULL_ERROR"] = "1" 
+# Install system dependencies (Ubuntu/Debian)
+sudo apt-get update && sudo apt-get install -y zstd swig
 
-print("STABLEWM_HOME set to:", os.environ["STABLEWM_HOME"])
-```
+# Install package dependencies
+pip install --upgrade pip
+pip install hydra-core lightning omegaconf einops wandb
+pip install "huggingface-hub>=0.34.0,<1.0" "datasets<3.0" "transformers>=4.45.0"
+pip install "stable-worldmodel[all]==0.1.1" "stable-pretraining==0.1.7"
+📦 Data Preparation
+Data is stored as compressed HDF5 archives (.tar.zst). Set $STABLEWM_HOME to specify the local cache directory:
 
-### Step 2: Download & Extract the Dataset
+Bash
 
-This downloads the `tworoom` dataset directly from HuggingFace and extracts it to the correct cache directory.
 
-```python
+export STABLEWM_HOME="$HOME/.stable-wm"
+mkdir -p "$STABLEWM_HOME"
+
+# Example: Download and extract Two Rooms
+python -c "
 from huggingface_hub import hf_hub_download
 import os
+path = hf_hub_download(repo_id='quentinll/lewm-tworooms', filename='tworoom.tar.zst', repo_type='dataset')
+os.system(f'tar --zstd -xvf {path} -C $STABLEWM_HOME')
+"
+🏋️ Training
+Local Run
+Run the default training pipeline with standard LeJEPA or EQM loss enabled:
 
-# Download the compressed dataset
-path = hf_hub_download(
-    repo_id="quentinll/lewm-tworooms",
-    filename="tworoom.tar.zst",
-    repo_type="dataset",
-    local_dir="/kaggle/working/data"
-)
-print("Downloaded to:", path)
+Bash
 
-# Move the file to our dedicated data folder
-!mv /kaggle/working/data/tworoom.tar.zst /kaggle/data/tworoom.tar.zst
 
-# Install zstd for extraction
-!apt-get update && apt-get install -y zstd
+export HYDRA_FULL_ERROR=1
+python train.py data=tworoom
+To configure hyperparameters or ablation weights directly from the CLI:
 
-# Extract the .h5 files into STABLEWM_HOME
+Bash
+
+
+# Disable EQM loss (baseline ablation)
+python train.py data=tworoom loss.eqm_pred_weight=0.0
+
+# Disable SIGReg (lambda=0 ablation)
+python train.py data=tworoom loss.sigreg.weight=0.0
+Kaggle GPU Execution
+Open a new Kaggle Notebook and attach an accelerator (GPU T4 x 2 or P100).
+
+Set up environment variables and directories:
+
+Python
+
+
+import os
+os.environ["STABLEWM_HOME"] = "/kaggle/working/stablewm"
+os.environ["HYDRA_FULL_ERROR"] = "1"
+os.makedirs("/kaggle/working/stablewm", exist_ok=True)
+os.makedirs("/kaggle/data", exist_ok=True)
+Download dependencies & data:
+
+Bash
+
+
+!apt-get update && !apt-get install -y zstd swig
+!pip install -q hydra-core lightning omegaconf einops wandb
+!pip install -q "huggingface-hub>=0.34.0,<1.0" "datasets<3.0" "transformers>=4.45.0"
+!pip install -q "stable-worldmodel[all]==0.1.1" "stable-pretraining==0.1.7"
+
+# Fetch data directly
+python -c "
+from huggingface_hub import hf_hub_download
+path = hf_hub_download(repo_id='quentinll/lewm-tworooms', filename='tworoom.tar.zst', repo_type='dataset', local_dir='/kaggle/data')
+"
 !tar --zstd -xvf /kaggle/data/tworoom.tar.zst -C /kaggle/working/stablewm/
+Authenticate WandB and launch:
 
-# Verify the extraction was successful
-!find /kaggle/working/stablewm/ -name "*.h5"
-```
+Python
 
-### Step 3: Configure Weights & Biases (WandB)
 
-Training relies heavily on WandB for logging. You must securely provide your API key using Kaggle Secrets and update the config file to point to your specific WandB entity (team/username).
-
-```python
-import wandb
 from kaggle_secrets import UserSecretsClient
+import wandb
 
-# Retrieve your WandB API key from Kaggle Secrets
-# Make sure you have added a secret named 'wandb_key' in the Kaggle side panel!
 user_secrets = UserSecretsClient()
-wandb_api_key = user_secrets.get_secret("wandb_key")
-wandb.login(key=wandb_api_key)
+wandb.login(key=user_secrets.get_secret("wandb_key"))
+Bash
 
-# Update the Hydra config to use your specific WandB entity
-filepath = "/kaggle/working/le-wm_kaggle/config/train/lewm.yaml"
 
-with open(filepath, "r") as f:
-    content = f.read()
-
-# Replace with your actual WandB team/username
-content = content.replace("entity: lewm", "entity: rodrickkamsi2-afe-babalola-university")
-
-with open(filepath, "w") as f:
-    f.write(content)
-
-print("Config updated. Verifying WandB entity:")
-for line in content.split("\n"):
-    if "entity" in line:
-        print(" ->", line.strip())
-```
-
-### Step 4: Start Training\!
-
-Launch the training script. Checkpoints will be automatically saved to your `/kaggle/working/stablewm` directory.
-
-```bash
 !python train.py data=tworoom
-```
+🎯 Evaluation & Planning
+Evaluation configs reside in config/eval/. Provide the policy path relative to $STABLEWM_HOME (omit _object.ckpt), or supply the direct filepath:
 
------
+Bash
 
-## Local Installation (For standard setups)
 
-If you are running this locally on your own hardware, the setup is slightly different:
+# Using policy checkpoint path
+python eval.py --config-name=tworoom.yaml policy=/kaggle/working/lewm_run/lewm_epoch_10_object
+Python API Inference
+To load a serialized cost model inside a custom model predictive control (MPC) loop:
 
-This codebase builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for training.
+Python
 
-**Installation:**
 
-```bash
-uv venv --python=3.10
-source .venv/bin/activate
-uv pip install stable-worldmodel[train,env]
-```
-
-## Data Management
-
-Datasets use the HDF5 format for fast loading. Download the data from [HuggingFace](https://huggingface.co/collections/quentinll/lewm) and decompress with:
-
-```bash
-tar --zstd -xvf archive.tar.zst
-```
-
-Place the extracted `.h5` files under `$STABLEWM_HOME` (defaults to `~/.stable-wm/` locally, or `/kaggle/working/stablewm` on Kaggle). Dataset names are specified without the `.h5` extension in the configs.
-
-## Planning & Evaluation
-
-Evaluation configs live under `config/eval/`. Set the `policy` field to the checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix:
-
-```bash
-# ✓ correct
-python eval.py --config-name=pusht.yaml policy=pusht/lewm
-
-# ✗ incorrect
-python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
-```
-
-## Pretrained Checkpoints
-
-Pre-trained checkpoints are available on [Google Drive](https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e). Download the checkpoint archive and place the extracted files under `$STABLEWM_HOME/`.
-
-\<div align="center"\>
-
-| Method | two-room | pusht | cube | reacher |
-|:---:|:---:|:---:|:---:|:---:|
-| pldm | ✓ | ✓ | ✓ | ✓ |
-| lejepa | ✓ | ✓ | ✓ | ✓ |
-| ivl | ✓ | ✓ | ✓ | — |
-| iql | ✓ | ✓ | ✓ | — |
-| gcbc | ✓ | ✓ | ✓ | — |
-| dinowm | ✓ | ✓ | — | — |
-| dinowm\_noprop | ✓ | ✓ | ✓ | ✓ |
-
-\</div\>
-
-## Loading a checkpoint via API
-
-Each tar archive contains two files per checkpoint:
-
-  * `<name>_object.ckpt` — a serialized Python object for convenient loading; this is what `eval.py` and the `stable_worldmodel` API use.
-  * `<name>_weight.ckpt` — a weights-only checkpoint (`state_dict`) for cases where you want to load weights into your own model instance.
-
-To load the object checkpoint via the `stable_worldmodel` API:
-
-```python
 import stable_worldmodel as swm
 
-# Load the cost model (for MPC)
-cost = swm.policy.AutoCostModel('pusht/lewm')
-```
+# Load serialized object policy
+cost_model = swm.policy.AutoCostModel("pusht/lewm")
+📚 Citation
+If you use this repository or its extensions in your research, please cite:
 
-This function accepts:
+Code snippet
 
-  * `run_name` — checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix.
-  * `cache_dir` — optional override for the checkpoint root.
 
-The returned module is in `eval` mode with its PyTorch weights accessible via `.state_dict()`.
-
-## Contact & Contributions
-
-Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues) on the original repository\! For questions or collaborations, please contact `lucas.maes@mila.quebec`
-
-If you find this code useful, please reference it in your paper:
-
-```bibtex
 @article{maes_lelidec2026lewm,
   title={LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels},
   author={Maes, Lucas and Le Lidec, Quentin and Scieur, Damien and LeCun, Yann and Balestriero, Randall},
-  journal={arXiv preprint},
+  journal={arXiv preprint arXiv:2603.19312},
   year={2026}
 }
-```
+
+@article{landscapeshape2026,
+  title={Landscape Shaping for Stable Latent Planning},
+  journal={Working Paper},
+  year={2026}
+}
