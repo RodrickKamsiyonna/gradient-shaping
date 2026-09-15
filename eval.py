@@ -42,7 +42,7 @@ def _patched_init_action(self, n_envs, actions=None):
         device=self.device,
         dtype=self.dtype,
     )
-    * 0.01)
+    * 0.1)
     remaining = self.horizon - actions.shape[2]
 
     if remaining > 0:
