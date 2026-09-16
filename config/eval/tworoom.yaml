@@ -1,6 +1,6 @@
 defaults:
   - launcher: local
-  - solver: adam
+  - solver: cem
   - _self_
 
 world:
