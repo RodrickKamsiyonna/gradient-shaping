@@ -111,14 +111,15 @@ def lejepa_forward(self, batch, stage, cfg):
 
     with torch.enable_grad():
         gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
+        
         eps = torch.randn_like(ctx_actions_raw)
-
-        act_gamma = (
-            gamma * ctx_actions_raw.detach() + (1 - gamma) * eps
-        ).requires_grad_(True)                          # (B, ctx_len, act_dim)
-
+        eps1 = torch.randn_like(ctx_emb)
+        
+        act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
+        ctx_n_emb = (gamma * ctx_emb.detach() + (1 - gamma) * eps1)
+        
         pred_emb_noisy = self.model.predict(
-            ctx_emb.detach(),
+            ctx_n_emb,
             self.model.action_encoder(act_gamma),
         )
 
