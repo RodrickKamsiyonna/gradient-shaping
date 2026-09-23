@@ -83,14 +83,12 @@ def lejepa_forward1(self, batch, stage, cfg):
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
-
 def lejepa_forward(self, batch, stage, cfg):
     """Encode observations, predict next states, compute losses with EQM."""
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
-    eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
     eqm_weight = cfg.loss.get("eqm_pred_weight", 0.5)
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -111,26 +109,37 @@ def lejepa_forward(self, batch, stage, cfg):
 
     with torch.enable_grad():
         gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
-        
+
         eps = torch.randn_like(ctx_actions_raw)
         eps1 = torch.randn_like(ctx_emb)
-        
-        act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
-        ctx_n_emb = (gamma * ctx_emb.detach() + (1 - gamma) * eps1)
-        
+
+        act_gamma = (
+            gamma * ctx_actions_raw.detach() + (1 - gamma) * eps
+        ).requires_grad_(True)
+        ctx_n_emb = gamma * ctx_emb.detach() + (1 - gamma) * eps1
+
         pred_emb_noisy = self.model.predict(
             ctx_n_emb,
             self.model.action_encoder(act_gamma),
         )
 
-        # detach tgt_emb: target only, no cross-stream grad-fn kept alive
         energy = (pred_emb_noisy - tgt_emb.detach()).pow(2).mean(dim=-1).sum()
 
-        grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
+        grad_energy = torch.autograd.grad(
+            energy, act_gamma, create_graph=True
+        )[0]
 
-        target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
+        target_grad = eps - ctx_actions_raw.detach()
 
-    output["pred_loss_eqm"] = (grad_energy - target_grad).pow(2).mean()
+    grad_energy = F.normalize(grad_energy.flatten(1), dim=1, eps=1e-8)
+    target_grad = F.normalize(target_grad.flatten(1), dim=1, eps=1e-8)
+
+    cosine_loss = 1 - (grad_energy * target_grad).sum(dim=1)
+    weight = (1 - gamma).flatten()
+    output["pred_loss_eqm"] = (
+        weight * cosine_loss
+    ).sum() / weight.sum().clamp_min(1e-8)
+
     output["energy"] = energy.detach()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
 
@@ -144,8 +153,6 @@ def lejepa_forward(self, batch, stage, cfg):
     losses_dict[f"{stage}/energy"] = output["energy"]
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
