@@ -168,7 +168,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
         energy = (
             pred_emb_noisy - tgt_emb.detach()
-        ).pow(2).mean(dim=-1).sum()
+        ).pow(2).mean()
 
         grad_energy = torch.autograd.grad(
             energy,
