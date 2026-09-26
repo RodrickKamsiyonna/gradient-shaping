@@ -53,27 +53,7 @@ class ResumableDataLoader(torch.utils.data.DataLoader):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Forward passes
-# ─────────────────────────────────────────────────────────────────────────────
-
-def lejepa_forward1(self, batch, stage, cfg):
-    """Encode observations, predict next states, compute losses (baseline)."""
-
-    ctx_len = cfg.wm.history_size
-    n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
-
-    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-
-    output = self.model.encode(batch)
-
-    emb = output["emb"]
-    act_emb = output["act_emb"]
-
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
-
-
-
+# ───────────────────────────────────────────────────────────────────────────
 def lejepa_forward(self, batch, stage, cfg):
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
