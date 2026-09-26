@@ -1,7 +1,4 @@
-import json
 import os
-import shutil
-from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 
@@ -10,7 +7,6 @@ import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
-import torch.nn.functional as F
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
@@ -20,115 +16,62 @@ from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
-CHECKPOINT_INTERVAL = 500
-
-# stable-pretraining silently redirects every ModelCheckpoint's dirpath to
-# {cache_dir}/runs/{date}/{time}/{run_id}/checkpoints/ whenever its global
-# `cache_dir` setting is active (via SPT_CACHE_DIR env var or a prior
-# spt.set(cache_dir=...) call anywhere in the process, e.g. inside
-# stable_worldmodel). That's what was producing paths like
-# /root/.cache/stable-pretraining/runs/.../checkpoints/lewm_last.ckpt instead
-# of the run_dir under /kaggle/working configured below. Explicitly setting
-# cache_dir=None here disables that redirection so our own dirpath is honored.
-spt.set(cache_dir=None)
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Resumable DataLoader
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ResumableDataLoader(torch.utils.data.DataLoader):
+    """DataLoader that supports state_dict / load_state_dict for mid-epoch resume.
+
+    On checkpoint save, Lightning calls state_dict() and stores the number of
+    batches already consumed this epoch.  On resume, load_state_dict() restores
+    that count and __iter__ silently skips those batches so training picks up
+    exactly where it left off.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._start_idx = 0
+        self._start_idx = 0  # batches already consumed this epoch
 
+    # ── checkpoint interface ──────────────────────────────────────────────────
     def state_dict(self):
         return {"start_idx": self._start_idx}
 
-    def load_state_dict(self, state):
+    def load_state_dict(self, state: dict):
         self._start_idx = state.get("start_idx", 0)
 
+    # ── skip already-seen batches on resume ───────────────────────────────────
     def __iter__(self):
         iterator = super().__iter__()
         for i, batch in enumerate(iterator):
             if i < self._start_idx:
-                continue
-            self._start_idx = 0
+                continue          # fast-forward past consumed batches
+            self._start_idx = 0  # clear after the first yielded batch
             yield batch
-        self._start_idx = 0
+        self._start_idx = 0       # full epoch done — reset for next epoch
 
 
-class RollingModelCheckpoint(ModelCheckpoint):
-    def __init__(self, status_path, **kwargs):
-        self.status_path = Path(status_path)
-        super().__init__(**kwargs)
-
-    def _save_checkpoint(self, trainer, filepath):
-        super()._save_checkpoint(trainer, filepath)
-
-        if not trainer.is_global_zero:
-            return
-
-        checkpoint_path = Path(filepath)
-        if not checkpoint_path.is_file():
-            print(f"WARNING: checkpoint does not exist: {checkpoint_path}")
-            return
-
-        metadata = {
-            "checkpoint": checkpoint_path.name,
-            "checkpoint_path": str(checkpoint_path),
-            "global_step": int(trainer.global_step),
-            "epoch": int(trainer.current_epoch),
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-            "file_size_bytes": checkpoint_path.stat().st_size,
-        }
-
-        tmp_path = self.status_path.with_suffix(
-            self.status_path.suffix + ".tmp"
-        )
-
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=2)
-                f.write("\n")
-            os.replace(tmp_path, self.status_path)
-            print(
-                f"[Checkpoint] Saved {checkpoint_path.name} "
-                f"at global_step={trainer.global_step}, "
-                f"epoch={trainer.current_epoch}"
-            )
-        except Exception as exc:
-            print(f"WARNING: failed to write checkpoint metadata: {exc}")
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except OSError:
-                pass
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Forward passes
+# ─────────────────────────────────────────────────────────────────────────────
 
 def lejepa_forward1(self, batch, stage, cfg):
+    """Encode observations, predict next states, compute losses (baseline)."""
+
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+
     output = self.model.encode(batch)
 
     emb = output["emb"]
     act_emb = output["act_emb"]
+
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, :ctx_len]
-    tgt_emb = emb[:, n_preds:]
 
-    pred_emb = self.model.predict(ctx_emb, ctx_act)
-
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
-
-    self.log_dict(
-        {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k},
-        on_step=True,
-        sync_dist=True,
-    )
-
-    return output
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -233,174 +176,66 @@ def lejepa_forward(self, batch, stage, cfg):
     return output
 
 
-def migrate_legacy_cache_checkpoint(run_dir: Path, model_name: str):
-    """One-time recovery for runs trained before cache_dir was disabled.
-
-    Earlier runs saved checkpoints under stable-pretraining's cache_dir
-    (e.g. /root/.cache/stable-pretraining/runs/.../checkpoints/) instead of
-    run_dir, because spt.Manager silently redirected the ModelCheckpoint's
-    dirpath there. If run_dir has no checkpoint yet, this looks for the most
-    recently modified matching checkpoint under known cache locations and
-    copies it into run_dir, so training resumes from where it left off
-    instead of restarting from scratch. Once a checkpoint exists in
-    run_dir, this becomes a no-op on every subsequent run.
-    """
-    target = run_dir / f"{model_name}_last.ckpt"
-    if target.is_file():
-        return
-
-    env_cache = os.environ.get("SPT_CACHE_DIR")
-    search_bases = [
-        Path(env_cache).expanduser() if env_cache else None,
-        Path.home() / ".cache" / "stable-pretraining",
-        Path.home() / ".cache" / "stable_pretraining",
-    ]
-
-    candidates = []
-    for base in search_bases:
-        if base is None or not base.is_dir():
-            continue
-        candidates.extend(base.glob(f"runs/**/checkpoints/{model_name}_last.ckpt"))
-
-    if not candidates:
-        return
-
-    latest = max(candidates, key=lambda p: p.stat().st_mtime)
-
-    print("\n" + "=" * 72)
-    print("MIGRATING CHECKPOINT FROM STABLE-PRETRAINING CACHE DIR")
-    print("=" * 72)
-    print(f"Found    : {latest}")
-    print(f"Moving to: {target}")
-
-    shutil.copy2(latest, target)
-
-    try:
-        ckpt = torch.load(latest, map_location="cpu", weights_only=False)
-        status = {
-            "checkpoint": target.name,
-            "checkpoint_path": str(target),
-            "global_step": int(ckpt.get("global_step", -1)),
-            "epoch": int(ckpt.get("epoch", -1)),
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-            "file_size_bytes": target.stat().st_size,
-            "migrated_from": str(latest),
-        }
-        with open(run_dir / "checkpoint_status.json", "w", encoding="utf-8") as f:
-            json.dump(status, f, indent=2)
-            f.write("\n")
-        print(f"Recovered global_step={status['global_step']}, epoch={status['epoch']}")
-    except Exception as exc:
-        print(f"WARNING: copied checkpoint but could not rebuild status file: {exc}")
-
-    print("=" * 72 + "\n")
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_latest_checkpoint(run_dir: Path, model_name: str):
-    checkpoint_path = run_dir / f"{model_name}_last.ckpt"
-    status_path = run_dir / "checkpoint_status.json"
-
-    if not checkpoint_path.is_file():
-        print("No rolling checkpoint found. Starting a fresh run.")
+    """Find the latest step checkpoint for auto-resume."""
+    ckpts = list(run_dir.glob(f"{model_name}_step*.ckpt"))
+    if not ckpts:
         return None
 
-    if status_path.is_file():
+    def extract_step(p):
         try:
-            with open(status_path, "r", encoding="utf-8") as f:
-                status = json.load(f)
+            return int(str(p.stem).split("step=")[-1])
+        except Exception:
+            return -1
 
-            print("\n" + "=" * 72)
-            print("RESUMING FROM ROLLING CHECKPOINT")
-            print("=" * 72)
-            print(f"Checkpoint : {status.get('checkpoint')}")
-            print(f"Global step: {status.get('global_step')}")
-            print(f"Epoch      : {status.get('epoch')}")
-            print(f"Saved at   : {status.get('saved_at')}")
-            print(f"File size  : {status.get('file_size_bytes')} bytes")
-            print("=" * 72 + "\n")
-        except Exception as exc:
-            print(f"WARNING: could not read {status_path}: {exc}")
-    else:
-        print(f"Found checkpoint but no metadata file: {checkpoint_path}")
-
-    return checkpoint_path
+    latest = max(ckpts, key=extract_step)
+    print(f"Auto-resuming from: {latest}")
+    return latest
 
 
-def remove_old_step_checkpoints(run_dir: Path, model_name: str):
-    old_checkpoints = list(run_dir.glob(f"{model_name}_step*.ckpt"))
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if not old_checkpoints:
-        return
-
-    print(f"Removing {len(old_checkpoints)} old step-based checkpoint(s)...")
-
-    for checkpoint in old_checkpoints:
-        try:
-            checkpoint.unlink()
-            print(f"Removed: {checkpoint.name}")
-        except OSError as exc:
-            print(f"Could not remove {checkpoint}: {exc}")
-
-
-@hydra.main(
-    version_base=None,
-    config_path="./config/train",
-    config_name="lewm",
-)
+@hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
-    dataset = swm.data.HDF5Dataset(
-        **cfg.data.dataset,
-        transform=None,
-    )
 
-    transforms = [
-        get_img_preprocessor(
-            source="pixels",
-            target="pixels",
-            img_size=cfg.img_size,
-        )
-    ]
+    # ── dataset ───────────────────────────────────────────────────────────────
+    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
 
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
+            normalizer = get_column_normalizer(dataset, col, col)
+            transforms.append(normalizer)
+            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
 
-            transforms.append(
-                get_column_normalizer(dataset, col, col)
-            )
-
-            setattr(
-                cfg.wm,
-                f"{col}_dim",
-                dataset.get_dim(col),
-            )
-
-    dataset.transform = spt.data.transforms.Compose(*transforms)
+    transform = spt.data.transforms.Compose(*transforms)
+    dataset.transform = transform
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
-
     train_set, val_set = spt.data.random_split(
         dataset,
         lengths=[cfg.train_split, 1 - cfg.train_split],
         generator=rnd_gen,
     )
 
+    # ResumableDataLoader — supports state_dict / load_state_dict so Lightning
+    # can skip already-consumed batches when resuming a mid-epoch checkpoint.
     train = ResumableDataLoader(
-        train_set,
-        **cfg.loader,
-        shuffle=True,
-        drop_last=True,
-        generator=rnd_gen,
+        train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen
     )
-
     val = ResumableDataLoader(
-        val_set,
-        **cfg.loader,
-        shuffle=False,
-        drop_last=False,
+        val_set, **cfg.loader, shuffle=False, drop_last=False
     )
 
+    # ── model / optimiser ─────────────────────────────────────────────────────
     encoder = spt.backbone.utils.vit_hf(
         cfg.encoder_scale,
         patch_size=cfg.patch_size,
@@ -411,10 +246,7 @@ def run(cfg):
 
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
-
-    effective_act_dim = (
-        cfg.data.dataset.frameskip * cfg.wm.action_dim
-    )
+    effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
 
     predictor = ARPredictor(
         num_frames=cfg.wm.history_size,
@@ -424,10 +256,7 @@ def run(cfg):
         **cfg.predictor,
     )
 
-    action_encoder = Embedder(
-        input_dim=effective_act_dim,
-        emb_dim=embed_dim,
-    )
+    action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
 
     projector = MLP(
         input_dim=hidden_dim,
@@ -468,11 +297,7 @@ def run(cfg):
         },
     }
 
-    data_module = spt.data.DataModule(
-        train=train,
-        val=val,
-    )
-
+    data_module = spt.data.DataModule(train=train, val=val)
     world_model = spt.Module(
         model=world_model,
         sigreg=SIGReg(**cfg.loss.sigreg.kwargs),
@@ -480,43 +305,24 @@ def run(cfg):
         optim=optimizers,
     )
 
-    run_dir = Path(
-        "/kaggle/working",
-        cfg.get("subdir") or "lewm_run",
-    )
+    # ── training ──────────────────────────────────────────────────────────────
+    run_dir = Path("/kaggle/working", cfg.get("subdir") or "lewm_run")
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    migrate_legacy_cache_checkpoint(run_dir, cfg.output_model_name)
 
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
 
-    remove_old_step_checkpoints(
-        run_dir,
-        cfg.output_model_name,
-    )
-
     logger = None
-
     if cfg.wandb.enabled:
         logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(
-            OmegaConf.to_container(cfg, resolve=True)
-        )
+        logger.log_hyperparams(OmegaConf.to_container(cfg))
 
-    checkpoint_path = (
-        run_dir / f"{cfg.output_model_name}_last.ckpt"
-    )
-    status_path = run_dir / "checkpoint_status.json"
-
-    step_checkpoint = RollingModelCheckpoint(
-        status_path=status_path,
+    step_checkpoint = ModelCheckpoint(
         dirpath=run_dir,
-        filename=f"{cfg.output_model_name}_last",
-        every_n_train_steps=CHECKPOINT_INTERVAL,
-        save_top_k=1,
+        filename=f"{cfg.output_model_name}_step{{step}}",
+        every_n_train_steps=500,
+        save_top_k=1,       # only keep the latest to save disk space
         save_last=False,
-        enable_version_counter=False,
     )
 
     object_dump_callback = ModelObjectCallBack(
@@ -527,25 +333,20 @@ def run(cfg):
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[
-            step_checkpoint,
-            object_dump_callback,
-        ],
+        callbacks=[step_checkpoint, object_dump_callback],
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,
     )
 
-    latest_ckpt = get_latest_checkpoint(
-        run_dir,
-        cfg.output_model_name,
-    )
+    # Auto-resume from latest step checkpoint if one exists
+    latest_ckpt = get_latest_checkpoint(run_dir, cfg.output_model_name)
 
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=latest_ckpt,
+        ckpt_path=latest_ckpt,  # None → fresh run; path → mid-epoch resume
     )
 
     manager()
