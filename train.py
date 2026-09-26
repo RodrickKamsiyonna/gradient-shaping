@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -20,6 +21,16 @@ from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBa
 
 
 CHECKPOINT_INTERVAL = 500
+
+# stable-pretraining silently redirects every ModelCheckpoint's dirpath to
+# {cache_dir}/runs/{date}/{time}/{run_id}/checkpoints/ whenever its global
+# `cache_dir` setting is active (via SPT_CACHE_DIR env var or a prior
+# spt.set(cache_dir=...) call anywhere in the process, e.g. inside
+# stable_worldmodel). That's what was producing paths like
+# /root/.cache/stable-pretraining/runs/.../checkpoints/lewm_last.ckpt instead
+# of the run_dir under /kaggle/working configured below. Explicitly setting
+# cache_dir=None here disables that redirection so our own dirpath is honored.
+spt.set(cache_dir=None)
 
 
 class ResumableDataLoader(torch.utils.data.DataLoader):
@@ -222,6 +233,69 @@ def lejepa_forward(self, batch, stage, cfg):
     return output
 
 
+def migrate_legacy_cache_checkpoint(run_dir: Path, model_name: str):
+    """One-time recovery for runs trained before cache_dir was disabled.
+
+    Earlier runs saved checkpoints under stable-pretraining's cache_dir
+    (e.g. /root/.cache/stable-pretraining/runs/.../checkpoints/) instead of
+    run_dir, because spt.Manager silently redirected the ModelCheckpoint's
+    dirpath there. If run_dir has no checkpoint yet, this looks for the most
+    recently modified matching checkpoint under known cache locations and
+    copies it into run_dir, so training resumes from where it left off
+    instead of restarting from scratch. Once a checkpoint exists in
+    run_dir, this becomes a no-op on every subsequent run.
+    """
+    target = run_dir / f"{model_name}_last.ckpt"
+    if target.is_file():
+        return
+
+    env_cache = os.environ.get("SPT_CACHE_DIR")
+    search_bases = [
+        Path(env_cache).expanduser() if env_cache else None,
+        Path.home() / ".cache" / "stable-pretraining",
+        Path.home() / ".cache" / "stable_pretraining",
+    ]
+
+    candidates = []
+    for base in search_bases:
+        if base is None or not base.is_dir():
+            continue
+        candidates.extend(base.glob(f"runs/**/checkpoints/{model_name}_last.ckpt"))
+
+    if not candidates:
+        return
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+
+    print("\n" + "=" * 72)
+    print("MIGRATING CHECKPOINT FROM STABLE-PRETRAINING CACHE DIR")
+    print("=" * 72)
+    print(f"Found    : {latest}")
+    print(f"Moving to: {target}")
+
+    shutil.copy2(latest, target)
+
+    try:
+        ckpt = torch.load(latest, map_location="cpu", weights_only=False)
+        status = {
+            "checkpoint": target.name,
+            "checkpoint_path": str(target),
+            "global_step": int(ckpt.get("global_step", -1)),
+            "epoch": int(ckpt.get("epoch", -1)),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "file_size_bytes": target.stat().st_size,
+            "migrated_from": str(latest),
+        }
+        with open(run_dir / "checkpoint_status.json", "w", encoding="utf-8") as f:
+            json.dump(status, f, indent=2)
+            f.write("\n")
+        print(f"Recovered global_step={status['global_step']}, epoch={status['epoch']}")
+    except Exception as exc:
+        print(f"WARNING: copied checkpoint but could not rebuild status file: {exc}")
+
+    print("=" * 72 + "\n")
+
+
 def get_latest_checkpoint(run_dir: Path, model_name: str):
     checkpoint_path = run_dir / f"{model_name}_last.ckpt"
     status_path = run_dir / "checkpoint_status.json"
@@ -411,6 +485,8 @@ def run(cfg):
         cfg.get("subdir") or "lewm_run",
     )
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    migrate_legacy_cache_checkpoint(run_dir, cfg.output_model_name)
 
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
